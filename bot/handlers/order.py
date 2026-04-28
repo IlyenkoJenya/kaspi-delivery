@@ -1,287 +1,164 @@
 import asyncio
 import re
 
-from aiogram import Bot, Router
+from aiogram import Router, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from bot.agent.delivery_session import KaspiDeliverySession
 from bot.keyboards.inline import phone_confirm_keyboard, review_keyboard
+from bot.services import kaspi_api
 from bot.services.report import log_delivery, log_phone_update, log_review
 from bot.services.review import generate_review
 from bot.states.order_states import OrderFlow
 
 order_router = Router()
+MAX_SMS_ATTEMPTS = 3
+_SMS_RE = re.compile(r"^\d{4}$")
 
-# user_id → active Playwright session
-active_sessions: dict[int, KaspiDeliverySession] = {}
-
-SMS_CODE_RE = re.compile(r"^\d{4}$")
-
-
-# ── /start ────────────────────────────────────────────────────────────────────
 
 @order_router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    user_id = message.from_user.id
-    session = active_sessions.pop(user_id, None)
-    if session:
-        session.cancel()
     await state.clear()
     await state.set_state(OrderFlow.waiting_order_id)
     await message.answer("Введите номер заказа Kaspi:")
 
 
-# ── Ввод order_id ─────────────────────────────────────────────────────────────
-
 @order_router.message(OrderFlow.waiting_order_id)
-async def handle_order_id(message: Message, state: FSMContext, bot: Bot) -> None:
-    order_id = message.text.strip()
-    user_id = message.from_user.id
-    chat_id = message.chat.id
+async def handle_order_id(message: Message, state: FSMContext) -> None:
+    order_code = message.text.strip()
+    await message.answer("Ищу заказ...")
 
-    async def notify(text: str) -> None:
-        await bot.send_message(chat_id, text)
-
-    session = KaspiDeliverySession(user_id, notify)
-    active_sessions[user_id] = session
-
-    await message.answer(
-        "🔄 Подключаюсь к Kaspi и получаю данные заказа...\n"
-        "Это займёт ~30 секунд. Можно ввести /cancel для отмены."
-    )
-    await session.start(order_id)
-
-    try:
-        order_info = await asyncio.wait_for(session.order_info_queue.get(), timeout=120)
-    except asyncio.TimeoutError:
-        active_sessions.pop(user_id, None)
-        await state.clear()
-        await message.answer("⏰ Таймаут подключения к Kaspi. Попробуйте снова (/start).")
+    order, token = await asyncio.to_thread(kaspi_api.find_order, order_code)
+    if not order:
+        await message.answer("Заказ не найден. Проверьте номер и попробуйте снова.")
         return
 
-    if order_info is None:
-        active_sessions.pop(user_id, None)
-        await state.clear()
-        await message.answer(
-            "❌ Заказ не найден или ошибка подключения.\n"
-            "Проверьте номер заказа и попробуйте снова (/start)."
-        )
+    order_id = order["id"]
+    customer = order["attributes"].get("customer", {})
+    customer_name = customer.get("name") or (
+        f"{customer.get('firstName', '')} {customer.get('lastName', '')}".strip()
+    )
+
+    product = await asyncio.to_thread(kaspi_api.get_order_product, order_id, token)
+
+    ok, resp = await asyncio.to_thread(kaspi_api.send_delivery_code, order_id, order_code, token)
+    if not ok:
+        await message.answer(f"Ошибка при отправке кода клиенту:\n<code>{resp}</code>", parse_mode="HTML")
         return
 
     await state.update_data(
+        order_code=order_code,
         order_id=order_id,
-        product=order_info["product"],
-        client_name=order_info.get("client_name", ""),
-        client_phone=order_info.get("phone", ""),
+        token=token,
+        customer_name=customer_name,
+        product=product,
+        sms_attempts=0,
+    )
+    await state.set_state(OrderFlow.waiting_sms_code)
+    await message.answer(
+        f"Заказ: {order_code}\n"
+        f"Клиент: {customer_name}\n"
+        f"Товар: {product}\n\n"
+        "Код отправлен клиенту. Введите 4-значный SMS-код:"
     )
 
-    info_text = (
-        f"📦 Заказ #{order_id}\n"
-        f"🛍 Товар: {order_info['product']}\n"
-        f"👤 Клиент: {order_info['client_name']}"
-    )
 
-    if order_info.get("error") == "no_deliver_btn":
-        active_sessions.pop(user_id, None)
-        await state.clear()
-        await message.answer(
-            f"{info_text}\n\n"
-            "⚠️ Кнопка 'Выдать заказ' недоступна.\n"
-            "Возможно заказ уже выдан или имеет другой статус."
-        )
-        return
-
-    if order_info.get("has_phone", True):
-        await state.set_state(OrderFlow.waiting_code)
-        await message.answer(
-            f"{info_text}\n\n"
-            "📲 SMS с кодом отправлен клиенту!\n"
-            "Введите 4-значный код из SMS клиента:"
-        )
-    else:
-        await state.set_state(OrderFlow.waiting_phone)
-        await message.answer(
-            f"{info_text}\n\n"
-            "📵 Телефон клиента не указан.\n"
-            "Введите номер телефона клиента:"
-        )
-
-
-# ── Ввод SMS-кода (Path A) ────────────────────────────────────────────────────
-
-@order_router.message(OrderFlow.waiting_code)
-async def handle_code(message: Message, state: FSMContext, bot: Bot) -> None:
+@order_router.message(OrderFlow.waiting_sms_code)
+async def handle_sms_code(message: Message, state: FSMContext) -> None:
     code = message.text.strip()
-    user_id = message.from_user.id
-
-    if not SMS_CODE_RE.match(code):
-        await message.answer("❗ Код должен быть ровно 4 цифры. Попробуйте ещё раз:")
+    if not _SMS_RE.match(code):
+        await message.answer("Код должен быть ровно 4 цифры. Попробуйте ещё раз:")
         return
-
-    session = active_sessions.get(user_id)
-    if not session:
-        await state.clear()
-        await message.answer("❌ Сессия не найдена. Начните заново: /start")
-        return
-
-    await session.sms_code_queue.put(code)
 
     data = await state.get_data()
-    if data.get("awaiting_delivery"):
-        await message.answer("⏳ Проверяю код...")
+    attempts = data.get("sms_attempts", 0) + 1
+
+    ok, resp = await asyncio.to_thread(
+        kaspi_api.confirm_delivery,
+        data["order_id"], data["order_code"], data["token"], code,
+    )
+
+    if ok:
+        await _on_delivery_success(message, state, data)
         return
 
-    await state.update_data(awaiting_delivery=True)
-    await message.answer("⏳ Ввожу код в Kaspi, подтверждаю выдачу...")
-
-    try:
-        success = await asyncio.wait_for(session.delivery_done_queue.get(), timeout=1_000)
-    except asyncio.TimeoutError:
-        active_sessions.pop(user_id, None)
-        await state.clear()
-        await message.answer("⏰ Таймаут. Проверьте статус заказа вручную.")
-        return
-
-    active_sessions.pop(user_id, None)
-
-    if not success:
+    if attempts >= MAX_SMS_ATTEMPTS:
         await state.clear()
         await message.answer(
-            "❌ Не удалось подтвердить выдачу.\n"
-            "Проверьте вручную: https://kaspi.kz/mc/#/orders-new?status=DELIVERY"
+            f"Превышено количество попыток ({MAX_SMS_ATTEMPTS}).\n"
+            f"Ответ сервера: <code>{resp}</code>\n"
+            "Начните заново: /start",
+            parse_mode="HTML",
         )
         return
 
-    await _on_delivery_success(message, state)
+    await state.update_data(sms_attempts=attempts)
+    await message.answer(f"Неверный код. Попытка {attempts}/{MAX_SMS_ATTEMPTS}. Попробуйте ещё раз:")
 
 
-# ── Ввод телефона (Path B: нет телефона в заказе) ─────────────────────────────
-
-@order_router.message(OrderFlow.waiting_phone)
-async def handle_phone(message: Message, state: FSMContext, bot: Bot) -> None:
-    phone = message.text.strip()
-    user_id = message.from_user.id
-
-    session = active_sessions.get(user_id)
-    if not session:
-        await state.clear()
-        await message.answer("❌ Сессия не найдена. Начните заново: /start")
-        return
-
-    await message.answer(f"📞 Телефон {phone} получен. Подтверждаю заказ...")
-    await session.phone_queue.put(phone)
-
-    try:
-        success = await asyncio.wait_for(session.delivery_done_queue.get(), timeout=120)
-    except asyncio.TimeoutError:
-        active_sessions.pop(user_id, None)
-        await state.clear()
-        await message.answer("⏰ Таймаут. Проверьте статус заказа вручную.")
-        return
-
-    active_sessions.pop(user_id, None)
-
-    if not success:
-        await state.clear()
-        await message.answer(
-            "❌ Не удалось подтвердить выдачу.\n"
-            "Проверьте вручную: https://kaspi.kz/mc/#/orders-new?status=DELIVERY"
-        )
-        return
-
-    await state.update_data(client_phone=phone)
-    await _on_delivery_success(message, state)
+async def _on_delivery_success(message: Message, state: FSMContext, data: dict) -> None:
+    user = message.from_user
+    username = f"@{user.username}" if user.username else user.full_name
+    log_delivery(data["order_code"], data["product"], data["customer_name"], username)
+    await state.set_state(OrderFlow.waiting_phone_confirm)
+    await message.answer(
+        f"Заказ {data['order_code']} выдан!\n\nЗнаем реальный номер клиента?",
+        reply_markup=phone_confirm_keyboard(),
+    )
 
 
-# ── Проверка актуальности телефона ────────────────────────────────────────────
-
-@order_router.callback_query(OrderFlow.waiting_phone_confirm, lambda c: c.data == "phone_ok")
+@order_router.callback_query(OrderFlow.waiting_phone_confirm, F.data == "phone_ok")
 async def cb_phone_ok(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer()
     await _ask_for_review(callback.message, state)
 
 
-@order_router.callback_query(OrderFlow.waiting_phone_confirm, lambda c: c.data == "phone_changed")
+@order_router.callback_query(OrderFlow.waiting_phone_confirm, F.data == "phone_changed")
 async def cb_phone_changed(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer()
     await state.set_state(OrderFlow.waiting_phone_update)
-    await callback.message.answer("📞 Введите актуальный номер телефона клиента:")
+    await callback.message.answer("Введите актуальный номер телефона клиента:")
 
 
 @order_router.message(OrderFlow.waiting_phone_update)
 async def handle_phone_update(message: Message, state: FSMContext) -> None:
-    new_phone = message.text.strip()
+    phone = message.text.strip()
     data = await state.get_data()
-    order_id = data.get("order_id", "")
-    await state.update_data(client_phone=new_phone)
-    log_phone_update(order_id, new_phone)
-    await message.answer(f"✅ Номер {new_phone} сохранён.")
+    log_phone_update(data["order_code"], phone)
+    await message.answer(f"Номер {phone} сохранён.")
     await _ask_for_review(message, state)
-
-
-# ── Генерация отзыва ──────────────────────────────────────────────────────────
-
-@order_router.callback_query(OrderFlow.waiting_review_decision, lambda c: c.data == "review_yes")
-async def cb_review_yes(callback: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    product = data.get("product", "товар")
-    order_id = data.get("order_id", "")
-    user_id = callback.from_user.id
-
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("✍️ Генерирую отзывы, подождите...")
-
-    try:
-        reviews = await generate_review(product)
-        await callback.message.answer(reviews)
-        user = callback.from_user
-        username = f"@{user.username}" if user.username else user.full_name
-        log_review(order_id, product, username)
-    except Exception as e:
-        await callback.message.answer(f"⚠️ Не удалось сгенерировать отзыв: {e}")
-
-    await state.clear()
-    await callback.answer()
-
-
-@order_router.callback_query(OrderFlow.waiting_review_decision, lambda c: c.data == "review_no")
-async def cb_review_no(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("✅ Выдача завершена.")
-    await callback.answer()
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-async def _on_delivery_success(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    user = message.from_user if hasattr(message, "from_user") else None
-    username = f"@{user.username}" if (user and user.username) else (user.full_name if user else "")
-    log_delivery(
-        order_id=data.get("order_id", ""),
-        product=data.get("product", ""),
-        client_name=data.get("client_name", ""),
-        username=username,
-    )
-    await _ask_phone_confirm(message, state)
-
-
-async def _ask_phone_confirm(message: Message, state: FSMContext) -> None:
-    await state.set_state(OrderFlow.waiting_phone_confirm)
-    await message.answer(
-        "🎉 Заказ выдан!\n\nЗнаем реальный номер клиента?",
-        reply_markup=phone_confirm_keyboard(),
-    )
 
 
 async def _ask_for_review(message: Message, state: FSMContext) -> None:
     await state.set_state(OrderFlow.waiting_review_decision)
-    await message.answer(
-        "Сгенерировать варианты отзыва для клиента?",
-        reply_markup=review_keyboard(),
-    )
+    await message.answer("Сгенерировать варианты отзыва?", reply_markup=review_keyboard())
+
+
+@order_router.callback_query(OrderFlow.waiting_review_decision, F.data == "review_yes")
+async def cb_review_yes(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Генерирую отзывы...")
+
+    try:
+        reviews = await generate_review(data.get("product", "товар"))
+        user = callback.from_user
+        username = f"@{user.username}" if user.username else user.full_name
+        log_review(data["order_code"], data["product"], username)
+        await callback.message.answer(reviews)
+    except Exception as e:
+        await callback.message.answer(f"Не удалось сгенерировать отзыв: {e}")
+
+    await state.clear()
+
+
+@order_router.callback_query(OrderFlow.waiting_review_decision, F.data == "review_no")
+async def cb_review_no(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Выдача завершена.")
